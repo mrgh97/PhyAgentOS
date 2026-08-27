@@ -5,6 +5,7 @@ import os
 import select
 import signal
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 
 # Force UTF-8 encoding for Windows console
@@ -25,6 +26,14 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.patch_stdout import patch_stdout
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.progress import (
+    BarColumn,
+    DownloadColumn,
+    Progress,
+    TextColumn,
+    TimeRemainingColumn,
+    TransferSpeedColumn,
+)
 from rich.table import Table
 from rich.text import Text
 
@@ -41,6 +50,42 @@ app = typer.Typer(
 
 console = Console()
 EXIT_COMMANDS = {"exit", "quit", "/exit", "/quit", ":q"}
+
+
+@contextmanager
+def _download_progress():
+    tasks: dict[str, int] = {}
+    with Progress(
+        TextColumn("[cyan]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+
+        def report(event, artifact, downloaded: int, total: int | None) -> None:
+            label = artifact.name or artifact.artifact_id or "artifact"
+            task_id = tasks.get(artifact.url)
+            if event == "cached":
+                progress.console.print(
+                    f"[green]✓[/green] Using cached [cyan]{label}[/cyan] "
+                    f"({downloaded} bytes)"
+                )
+                return
+            if task_id is None:
+                progress.console.print(
+                    f"[bold]Downloading[/bold] [cyan]{label}[/cyan]\n"
+                    f"[dim]{artifact.url}[/dim]"
+                )
+                task_id = progress.add_task(label, total=total, completed=downloaded)
+                tasks[artifact.url] = task_id
+            else:
+                progress.update(task_id, total=total)
+            if event in {"advance", "complete"}:
+                progress.update(task_id, completed=downloaded)
+
+        yield report
 
 # ---------------------------------------------------------------------------
 # CLI input: prompt_toolkit for editing, paste, history, and display
@@ -280,65 +325,6 @@ def _make_provider(config: Config):
     return provider
 
 
-def _make_forge_verifier(config: Config, provider):
-    """Create the Forge task verifier and its serializable child provider config."""
-    if not config.forge.enabled or not config.agents.verification.service_enabled:
-        return None
-    from PhyAgentOS.agent.session_verifier import ForgeTaskVerifier
-
-    settings = config.agents.verification
-    model = settings.model or config.agents.defaults.model
-    provider_name = settings.provider or config.get_provider_name(model)
-    if not provider_name:
-        raise RuntimeError(f"cannot resolve verification provider for model {model!r}")
-    provider_name = provider_name.replace("-", "_")
-    provider_config = getattr(config.providers, provider_name, None)
-    if settings.provider is not None and provider_config is None:
-        raise RuntimeError(f"unknown verification provider {settings.provider!r}")
-    provider_spec = {
-        "provider_name": provider_name,
-        "model": model,
-        "api_key": provider_config.api_key if provider_config is not None else None,
-        "api_base": (
-            provider_config.api_base
-            if provider_config is not None and provider_config.api_base
-            else config.get_api_base(model)
-        ),
-        "extra_headers": (
-            provider_config.extra_headers if provider_config is not None else None
-        ),
-        "temperature": 0.0,
-        "max_tokens": min(4096, config.agents.defaults.max_tokens),
-        "reasoning_effort": config.agents.defaults.reasoning_effort,
-    }
-    return ForgeTaskVerifier(
-        workspace=config.workspace_path,
-        provider=provider,
-        model=model,
-        evidence_retention=settings.evidence_retention,
-        timeout_s=settings.timeout_s,
-        service_host=settings.service_host,
-        service_port=settings.service_port,
-        service_provider_spec=provider_spec,
-        max_calls=settings.max_verifier_calls_per_run,
-    )
-
-
-def _make_forge_orchestrator(config: Config, provider, bus):
-    if not config.forge.enabled:
-        return None
-    from PhyAgentOS.forge.orchestrator import ForgeSessionOrchestrator
-
-    return ForgeSessionOrchestrator(
-        workspace=config.workspace_path,
-        config=config.forge,
-        verifier=_make_forge_verifier(config, provider),
-        bus=bus,
-        max_replans=config.agents.verification.max_replans_per_episode,
-        replan_timeout_s=config.agents.verification.replan_timeout_s,
-    )
-
-
 def _active_skill_runtime():
     """Discover an explicitly started, healthy Skill runtime."""
     from PhyAgentOS.skill_runtime.integration import discover_active_runtime
@@ -422,7 +408,6 @@ def gateway(
         sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
-    forge_orchestrator = _make_forge_orchestrator(config, provider, bus)
     active_skill_runtime = _active_skill_runtime()
     session_manager = SessionManager(config.workspace_path)
 
@@ -447,7 +432,6 @@ def gateway(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         embodiment_registry=registry,
-        forge_orchestrator=forge_orchestrator,
         forge_tool_client=(
             active_skill_runtime.client
             if active_skill_runtime is not None
@@ -576,15 +560,7 @@ def gateway(
         try:
             await cron.start()
             await heartbeat.start()
-            if forge_orchestrator is not None:
-                await forge_orchestrator.start()
-            services = [
-                agent.run(),
-                channels.start_all(),
-            ]
-            if forge_orchestrator is not None:
-                services.append(forge_orchestrator.run())
-            await asyncio.gather(*services)
+            await asyncio.gather(agent.run(), channels.start_all())
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
@@ -592,8 +568,6 @@ def gateway(
             heartbeat.stop()
             cron.stop()
             agent.stop()
-            if forge_orchestrator is not None:
-                await forge_orchestrator.stop()
             await channels.stop_all()
 
     asyncio.run(run())
@@ -634,7 +608,6 @@ def agent(
 
     bus = MessageBus()
     provider = _make_provider(config)
-    forge_orchestrator = _make_forge_orchestrator(config, provider, bus)
     active_skill_runtime = _active_skill_runtime()
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
@@ -661,7 +634,6 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
         embodiment_registry=registry,
-        forge_orchestrator=forge_orchestrator,
         forge_tool_client=(
             active_skill_runtime.client
             if active_skill_runtime is not None
@@ -699,45 +671,12 @@ def agent(
     if message:
         # Single message mode — direct call, no bus needed
         async def run_once():
-            agent_task = None
-            orchestrator_task = None
             try:
-                if forge_orchestrator is not None:
-                    await forge_orchestrator.start()
-                    orchestrator_task = asyncio.create_task(forge_orchestrator.run())
                 with _thinking_ctx():
                     response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
                 _print_agent_response(response, render_markdown=markdown)
-                if forge_orchestrator is not None and forge_orchestrator.store.nonterminal():
-                    agent_task = asyncio.create_task(agent_loop.run())
-                    while forge_orchestrator.store.nonterminal():
-                        try:
-                            outbound = await asyncio.wait_for(
-                                bus.consume_outbound(), timeout=0.25
-                            )
-                            if outbound.content:
-                                _print_agent_response(
-                                    outbound.content, render_markdown=markdown
-                                )
-                        except asyncio.TimeoutError:
-                            pass
-                    try:
-                        outbound = await asyncio.wait_for(bus.consume_outbound(), timeout=5.0)
-                        if outbound.content:
-                            _print_agent_response(outbound.content, render_markdown=markdown)
-                    except asyncio.TimeoutError:
-                        pass
             finally:
                 agent_loop.stop()
-                if forge_orchestrator is not None:
-                    await forge_orchestrator.stop()
-                for task in (agent_task, orchestrator_task):
-                    if task is not None:
-                        task.cancel()
-                await asyncio.gather(
-                    *[task for task in (agent_task, orchestrator_task) if task is not None],
-                    return_exceptions=True,
-                )
                 await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -769,14 +708,7 @@ def agent(
             signal.signal(signal.SIGPIPE, signal.SIG_IGN)
 
         async def run_interactive():
-            if forge_orchestrator is not None:
-                await forge_orchestrator.start()
             bus_task = asyncio.create_task(agent_loop.run())
-            orchestrator_task = (
-                asyncio.create_task(forge_orchestrator.run())
-                if forge_orchestrator is not None
-                else None
-            )
             turn_done = asyncio.Event()
             turn_done.set()
             turn_response: list[str] = []
@@ -847,18 +779,10 @@ def agent(
                         break
             finally:
                 agent_loop.stop()
-                if forge_orchestrator is not None:
-                    await forge_orchestrator.stop()
                 outbound_task.cancel()
-                for task in (orchestrator_task,):
-                    if task is not None:
-                        task.cancel()
                 await asyncio.gather(
-                    *[
-                        task
-                        for task in (bus_task, outbound_task, orchestrator_task)
-                        if task is not None
-                    ],
+                    bus_task,
+                    outbound_task,
                     return_exceptions=True,
                 )
                 await agent_loop.close_mcp()
@@ -918,67 +842,99 @@ def _install_skill_bundle(archive: Path, expected_sha256: str | None) -> None:
     from PhyAgentOS.skill_runtime.registry import DownloadCache, RegistryClient
     from PhyAgentOS.skill_runtime.state import RuntimeStateStore
 
-    cache = DownloadCache()
-    try:
-        with RegistryClient() as registry:
-            with tempfile.TemporaryDirectory(prefix="paos-skill-preview-") as directory:
-                preview_root = Path(directory)
-                preview = SkillInstaller(
-                    preview_root / "skills",
-                    state_store=RuntimeStateStore(preview_root / "run"),
-                ).install(archive, expected_sha256=expected_sha256)
-                node_installer = NodeInstaller()
-                try:
-                    local = SkillCatalog().get(preview.name)
-                except SkillNotFoundError:
-                    local = None
-                for node_id, lock in sorted(preview.artifacts.nodes.items()):
-                    if node_installer.satisfies(lock):
-                        continue
-                    node_artifact = registry.node(lock.artifact_id)
-                    node_archive = cache.download(node_artifact)
-                    installed = node_installer.install(node_archive, lock)
-                    if not node_installer.satisfies(lock):
-                        raise RuntimeError(
-                            f"Node executable {installed!s} does not satisfy Skill lock "
-                            f"{node_id!r}"
-                        )
-                ready = local == preview and all(
-                    node_installer.satisfies(lock)
-                    for lock in preview.artifacts.nodes.values()
-                )
-            if ready:
-                console.print(
-                    f"[green]✓[/green] Skill [cyan]{preview.name}[/cyan] "
-                    f"{preview.version} is already ready"
-                )
-                return
-            manifest = SkillInstaller().install(archive, expected_sha256=expected_sha256)
-    finally:
-        cache.close()
+    with _download_progress() as report:
+        cache = DownloadCache(progress=report)
+        try:
+            with RegistryClient() as registry:
+                with tempfile.TemporaryDirectory(prefix="paos-skill-preview-") as directory:
+                    preview_root = Path(directory)
+                    preview = SkillInstaller(
+                        preview_root / "skills",
+                        state_store=RuntimeStateStore(preview_root / "run"),
+                    ).install(archive, expected_sha256=expected_sha256)
+                    node_installer = NodeInstaller()
+                    try:
+                        local = SkillCatalog().get(preview.name)
+                    except SkillNotFoundError:
+                        local = None
+                    for node_id, lock in sorted(preview.artifacts.nodes.items()):
+                        if node_installer.satisfies(lock):
+                            continue
+                        node_artifact = registry.node(lock.artifact_id)
+                        node_archive = cache.download(node_artifact)
+                        installed = node_installer.install(node_archive, lock)
+                        if not node_installer.satisfies(lock):
+                            raise RuntimeError(
+                                f"Node executable {installed!s} does not satisfy Skill lock "
+                                f"{node_id!r}"
+                            )
+                    ready = local == preview and all(
+                        node_installer.satisfies(lock)
+                        for lock in preview.artifacts.nodes.values()
+                    )
+                if ready:
+                    console.print(
+                        f"[green]✓[/green] Skill [cyan]{preview.name}[/cyan] "
+                        f"{preview.version} is already ready"
+                    )
+                    return
+                manifest = SkillInstaller().install(archive, expected_sha256=expected_sha256)
+        finally:
+            cache.close()
     console.print(
         f"[green]✓[/green] Installed Skill [cyan]{manifest.name}[/cyan] {manifest.version}"
     )
 
 
-def _install_skill_from_registry(name: str) -> None:
+def _confirm_skill_install(name: str, source: str, size: int) -> bool:
+    size_mib = size / (1024 * 1024)
+    console.print(
+        f"[bold]Skill:[/bold] [cyan]{name}[/cyan]\n"
+        f"[bold]Source:[/bold] {source}\n"
+        f"[bold]Skill Bundle:[/bold] {size_mib:.1f} MiB ({size} bytes)\n"
+        "[yellow]Additional Forge Node archives may be downloaded after the "
+        "Skill Bundle is inspected.[/yellow]"
+    )
+    return typer.confirm("Continue with installation and downloads?", default=False)
+
+
+def _install_skill_from_registry(
+    name: str,
+    *,
+    ask_confirmation: bool = False,
+) -> None:
     """Download a Skill bundle from the Resource Registry and install it."""
     from PhyAgentOS.skill_runtime.registry import DownloadCache, RegistryClient
 
-    cache = DownloadCache()
-    try:
-        with RegistryClient() as registry:
-            artifact = registry.skill(name)
+    with RegistryClient() as registry:
+        artifact = registry.skill(name)
+    if ask_confirmation and not _confirm_skill_install(name, artifact.url, artifact.size):
+        console.print("[yellow]Installation cancelled.[/yellow]")
+        return
+    with _download_progress() as report:
+        cache = DownloadCache(progress=report)
+        try:
             archive = cache.download(artifact)
-    finally:
-        cache.close()
+        finally:
+            cache.close()
     _install_skill_bundle(archive, expected_sha256=artifact.sha256)
 
 
-def _install_skill_from_local_bundle(path: Path) -> None:
+def _install_skill_from_local_bundle(
+    path: Path,
+    *,
+    ask_confirmation: bool = False,
+) -> None:
     """Install a locally packaged Skill bundle, resolving nodes via the Registry."""
     from PhyAgentOS.skill_runtime.archive import sha256_file
 
+    if ask_confirmation and not _confirm_skill_install(
+        path.name,
+        str(path.resolve()),
+        path.stat().st_size,
+    ):
+        console.print("[yellow]Installation cancelled.[/yellow]")
+        return
     _install_skill_bundle(path, expected_sha256=sha256_file(path))
 
 
@@ -1013,17 +969,26 @@ def skill_install(
         "--local",
         help="Treat NAME as a local .tar.gz Skill bundle path",
     ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Confirm installation and downloads without prompting",
+    ),
 ):
     """Install a Skill from the configured Resource Registry or a local bundle archive."""
     try:
         if local:
-            _install_skill_from_local_bundle(_resolve_local_bundle_path(name))
+            _install_skill_from_local_bundle(
+                _resolve_local_bundle_path(name),
+                ask_confirmation=not yes,
+            )
             return
         source = _resolve_skill_install_source(name)
         if isinstance(source, Path):
-            _install_skill_from_local_bundle(source)
+            _install_skill_from_local_bundle(source, ask_confirmation=not yes)
         else:
-            _install_skill_from_registry(source)
+            _install_skill_from_registry(source, ask_confirmation=not yes)
     except Exception as error:
         _skill_runtime_error(error)
 
@@ -1219,21 +1184,22 @@ def forge_node_install(
     from PhyAgentOS.skill_runtime.installer import NodeInstaller
     from PhyAgentOS.skill_runtime.registry import DownloadCache, RegistryClient
 
-    cache = DownloadCache()
-    try:
-        manifest = SkillCatalog().get(skill_name)
-        lock = manifest.artifacts.nodes.get(node_id)
-        if lock is None:
-            raise RuntimeError(f"Skill {skill_name!r} does not lock Node {node_id!r}")
-        with RegistryClient() as registry:
-            artifact = registry.node(lock.artifact_id)
-        archive = cache.download(artifact)
-        installed = NodeInstaller().install(archive, lock)
-    except Exception as error:
-        _skill_runtime_error(error)
-        return
-    finally:
-        cache.close()
+    with _download_progress() as report:
+        cache = DownloadCache(progress=report)
+        try:
+            manifest = SkillCatalog().get(skill_name)
+            lock = manifest.artifacts.nodes.get(node_id)
+            if lock is None:
+                raise RuntimeError(f"Skill {skill_name!r} does not lock Node {node_id!r}")
+            with RegistryClient() as registry:
+                artifact = registry.node(lock.artifact_id)
+            archive = cache.download(artifact)
+            installed = NodeInstaller().install(archive, lock)
+        except Exception as error:
+            _skill_runtime_error(error)
+            return
+        finally:
+            cache.close()
     console.print(
         f"[green]✓[/green] Installed Forge node "
         f"[cyan]{lock.node_id}[/cyan] {lock.version} ({lock.artifact_id}) at {installed}"
