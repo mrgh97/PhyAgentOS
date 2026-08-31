@@ -1,0 +1,23 @@
+mode: session_endpoint
+
+joints:
+  - {name: joint1, mode: position, unit: radians}
+  - {name: joint2, mode: position, unit: radians}
+  - {name: joint3, mode: position, unit: radians}
+  - {name: joint4, mode: position, unit: radians}
+  - {name: joint5, mode: position, unit: radians}
+  - {name: joint6, mode: position, unit: radians}
+  - {name: joint7, mode: position, unit: radians}
+
+policy:
+  type: lingbot_va
+  policy_id: lingbot_va_libero
+  auto_start: false
+  instruction: "placeholder, overwritten per episode"
+  device: cuda
+  pretrained_path: ${LINGBOT_VA_MODEL_DIR}
+  wan_pretrained_path: ${LINGBOT_VA_BASE_DIR}
+
+image_inputs:
+  image/main: image
+  image/second: image2

@@ -1,0 +1,58 @@
+# Generic LIBERO three-node flow. The benchmark owns evaluation and scoring;
+# the selected policy profile owns inference only.
+nodes:
+  - id: gateway
+    path: ${FORGE_RUNTIME_BIN}/gateway
+    args: --config gateway.yaml
+    inputs:
+      tick: dora/timer/millis/50
+      benchmark_tool_in:
+        source: libero_benchmark/tool_out
+        queue_size: 32
+      policy_tool_in:
+        source: policy/tool_out
+        queue_size: 32
+    outputs:
+      - tool_response
+      - benchmark_tool_out
+      - policy_tool_out
+
+  - id: libero_benchmark
+    path: ${FORGE_RUNTIME_BIN}/libero_benchmark
+    env:
+      BENCHMARK_CONFIG: benchmark.yaml
+      MUJOCO_GL: egl
+      PYOPENGL_PLATFORM: egl
+    inputs:
+      tick: dora/timer/millis/1000
+      tool_in:
+        source: gateway/benchmark_tool_out
+        queue_size: 32
+      action: policy/action
+    outputs:
+      - tool_out
+      - proprio_state
+      - image/main
+      - image/second
+      - policy_command
+      - benchmark_status
+      - benchmark_result
+
+  - id: policy
+    path: ${FORGE_RUNTIME_BIN}/lerobot_runner
+    args: infer --config policy.yaml
+    inputs:
+      tick: dora/timer/millis/20
+      tool_in:
+        source: gateway/policy_tool_out
+        queue_size: 32
+      policy_command:
+        source: libero_benchmark/policy_command
+        queue_size: 32
+      proprio_state: libero_benchmark/proprio_state
+      image/main: libero_benchmark/image/main
+      image/second: libero_benchmark/image/second
+    outputs:
+      - tool_out
+      - action
+      - policy_command_status
