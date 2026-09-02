@@ -275,6 +275,25 @@ class EmbodimentsConfig(Base):
     instances: list[EmbodimentInstanceConfig] = Field(default_factory=list)
 
 
+class ForgeEvidenceConfig(Base):
+    """Best-effort evidence capture performed by the PAOS Forge adapter."""
+
+    required_image_sources: list[str] = Field(default_factory=list)
+    capture_timeout_s: float = Field(default=5.0, gt=0)
+    post_capture_timeout_s: float = Field(default=5.0, gt=0)
+    connection_timeout_s: float = Field(default=2.0, gt=0)
+    max_artifact_bytes: int = Field(default=8 * 1024 * 1024, gt=0)
+    association_quality: Literal["best_effort"] = "best_effort"
+
+
+class ForgeConfig(Base):
+    """Agent-side timeout and evidence policy for an active Forge Skill runtime."""
+
+    request_timeout_s: float = Field(default=10.0, gt=0)
+    poll_interval_s: float = Field(default=0.5, ge=0.1, le=5.0)
+    execution_timeout_s: float = Field(default=300.0, gt=0)
+    evidence: ForgeEvidenceConfig = Field(default_factory=ForgeEvidenceConfig)
+
 DEFAULT_RESOURCE_REGISTRY_URL = "https://paos-resource-manager.dev.x-era.com"
 
 
@@ -307,11 +326,54 @@ class AgentModes(Base):
     models: dict[str, ModeConfig] = Field(default_factory=dict)
 
 
+class AgentVerificationConfig(Base):
+    """Global semantic verification service, retention, and recovery budgets."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    service_enabled: bool = True
+    model: str | None = None
+    provider: str | None = None
+    timeout_s: float = Field(default=180.0, gt=0)
+    evidence_retention: Literal["all", "failed", "none"] = "none"
+    max_replans_per_episode: int = Field(default=2, ge=0)
+    max_verifier_calls_per_run: int = Field(default=50, ge=0)
+    replan_timeout_s: float = Field(default=120.0, gt=0)
+    service_host: str = "127.0.0.1"
+    service_port: int = Field(default=8100, ge=1, le=65535)
+
+
+class AgentEvolutionConfig(Base):
+    """Task-level experience capture and guarded Skill evolution."""
+
+    model_config = ConfigDict(
+        alias_generator=to_camel,
+        populate_by_name=True,
+        extra="forbid",
+    )
+
+    enabled: bool = True
+    scope: Literal["verified_forge_lineage"] = "verified_forge_lineage"
+    promotion_mode: Literal["guarded_auto"] = "guarded_auto"
+    min_successful_episodes: int = Field(default=3, ge=1)
+    min_lesson_episodes: int = Field(default=3, ge=1)
+    max_lessons_per_skill: int = Field(default=8, ge=1, le=50)
+    max_evolution_calls_per_run: int = Field(default=20, ge=0)
+    model: str | None = None
+    provider: str | None = None
+
+
 class AgentsConfig(Base):
     """Agent configuration."""
 
     defaults: AgentDefaults = Field(default_factory=AgentDefaults)
     modes: AgentModes = Field(default_factory=AgentModes)
+    verification: AgentVerificationConfig = Field(default_factory=AgentVerificationConfig)
+    evolution: AgentEvolutionConfig = Field(default_factory=AgentEvolutionConfig)
 
 
 class ProviderConfig(Base):
@@ -414,16 +476,26 @@ class Config(BaseSettings):
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
     tools: ToolsConfig = Field(default_factory=ToolsConfig)
     embodiments: EmbodimentsConfig = Field(default_factory=EmbodimentsConfig)
+    forge: ForgeConfig = Field(default_factory=ForgeConfig)
     resource_registry: ResourceRegistryConfig = Field(default_factory=ResourceRegistryConfig)
 
     @model_validator(mode="before")
     @classmethod
     def reject_legacy_runtime_config(cls, value: Any) -> Any:
-        if isinstance(value, dict) and ({"runtime", "forge"} & value.keys()):
+        if isinstance(value, dict) and "runtime" in value:
             raise ValueError(
-                "legacy `runtime` and `forge` configuration is unsupported; "
-                "install and start a Skill runtime instead"
+                "legacy `runtime` configuration is unsupported; remove it and configure `forge`"
             )
+        if isinstance(value, dict) and isinstance(value.get("forge"), dict):
+            unsupported = sorted(
+                set(value["forge"])
+                & {"enabled", "baseUrl", "base_url", "apiVersion", "api_version"}
+            )
+            if unsupported:
+                raise ValueError(
+                    "Forge execution endpoints come only from an active installed Skill; "
+                    f"remove unsupported forge key(s): {', '.join(unsupported)}"
+                )
         return value
 
     @property

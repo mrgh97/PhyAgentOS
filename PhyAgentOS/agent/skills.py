@@ -7,6 +7,8 @@ import shutil
 from collections.abc import Callable
 from pathlib import Path
 
+import yaml
+
 from PhyAgentOS.config.loader import get_config_path
 
 # Default builtin skills directory (relative to this file)
@@ -58,14 +60,20 @@ class SkillsLoader:
                     if skill_file.exists():
                         skills.append({"name": skill_dir.name, "path": str(skill_file), "source": "workspace"})
 
-        # Installed skill bundles
+        # Installed bundles override built-ins but not workspace Skills.
         if self.installed_skills.exists():
             for skill_dir in self.installed_skills.iterdir():
                 if skill_dir.is_dir():
                     skill_file = skill_dir / "SKILL.md"
-                    if skill_file.exists() and not any(s["name"] == skill_dir.name for s in skills):
+                    if skill_file.exists() and not any(
+                        skill["name"] == skill_dir.name for skill in skills
+                    ):
                         skills.append(
-                            {"name": skill_dir.name, "path": str(skill_file), "source": "installed"}
+                            {
+                                "name": skill_dir.name,
+                                "path": str(skill_file),
+                                "source": "installed",
+                            }
                         )
 
         # Built-in skills
@@ -79,14 +87,27 @@ class SkillsLoader:
         # Filter by requirements
         if filter_unavailable:
             return [
-                s
-                for s in skills
+                skill
+                for skill in skills
                 if self._check_requirements(
-                    self._get_skill_meta(s["name"]),
-                    skill_name=s["name"],
+                    self._get_skill_meta(skill["name"]), skill_name=skill["name"]
                 )
             ]
         return skills
+
+    def resolve_skill(self, name: str, *, require_available: bool = True) -> dict[str, str] | None:
+        """Resolve a registered Skill by exact name without accepting arbitrary paths."""
+        if not re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name):
+            return None
+        for skill in self.list_skills(filter_unavailable=False):
+            if skill["name"] != name:
+                continue
+            if require_available and not self._check_requirements(
+                self._get_skill_meta(name), skill_name=name
+            ):
+                return None
+            return dict(skill)
+        return None
 
     def load_skill(self, name: str) -> str | None:
         """
@@ -103,7 +124,6 @@ class SkillsLoader:
         if workspace_skill.exists():
             return workspace_skill.read_text(encoding="utf-8")
 
-        # Check installed bundles
         installed_skill = self.installed_skills / name / "SKILL.md"
         if installed_skill.exists():
             return installed_skill.read_text(encoding="utf-8")
@@ -167,7 +187,9 @@ class SkillsLoader:
 
             # Show missing requirements for unavailable skills
             if not available:
-                missing = self._get_missing_requirements(skill_meta, skill_name=s["name"])
+                missing = self._get_missing_requirements(
+                    skill_meta, skill_name=s["name"]
+                )
                 if missing:
                     lines.append(f"    <requires>{escape_xml(missing)}</requires>")
 
@@ -177,10 +199,7 @@ class SkillsLoader:
         return "\n".join(lines)
 
     def _get_missing_requirements(
-        self,
-        skill_meta: dict,
-        *,
-        skill_name: str | None = None,
+        self, skill_meta: dict, *, skill_name: str | None = None
     ) -> str:
         """Get a description of missing requirements."""
         missing = []
@@ -203,10 +222,41 @@ class SkillsLoader:
 
     def _get_skill_description(self, name: str) -> str:
         """Get the description of a skill from its frontmatter."""
+        content = self.load_skill(name) or ""
+        managed = re.search(
+            r"<!-- paos:learned-workflow:start -->[\s\S]*?### Trigger\s+"
+            r"([\s\S]*?)(?=\n### |\n<!-- paos:learned-workflow:end -->)",
+            content,
+        )
+        if managed and managed.group(1).strip():
+            return " ".join(managed.group(1).split())
         meta = self.get_skill_metadata(name)
         if meta and meta.get("description"):
             return meta["description"]
         return name  # Fallback to skill name
+
+    def build_evolution_catalog(
+        self, activated_names: set[str]
+    ) -> list[dict[str, str]]:
+        """Return redaction-safe summaries plus managed text for activated Skills only."""
+        catalog: list[dict[str, str]] = []
+        for skill in self.list_skills(filter_unavailable=False):
+            item = {
+                "name": skill["name"],
+                "source": skill["source"],
+                "description": self._get_skill_description(skill["name"]),
+            }
+            if skill["name"] in activated_names:
+                content = self.load_skill(skill["name"]) or ""
+                managed = re.search(
+                    r"<!-- paos:learned-workflow:start -->[\s\S]*?"
+                    r"<!-- paos:learned-workflow:end -->",
+                    content,
+                )
+                if managed:
+                    item["managed_workflow"] = managed.group(0)[:12000]
+            catalog.append(item)
+        return catalog
 
     def _strip_frontmatter(self, content: str) -> str:
         """Remove YAML frontmatter from markdown content."""
@@ -216,19 +266,16 @@ class SkillsLoader:
                 return content[match.end():].strip()
         return content
 
-    def _parse_paos_metadata(self, raw: str) -> dict:
+    def _parse_paos_metadata(self, raw: str | dict) -> dict:
         """Parse skill metadata JSON from frontmatter (supports PhyAgentOS and openclaw keys)."""
         try:
-            data = json.loads(raw)
+            data = raw if isinstance(raw, dict) else json.loads(raw)
             return data.get("PhyAgentOS", data.get("openclaw", {})) if isinstance(data, dict) else {}
         except (json.JSONDecodeError, TypeError):
             return {}
 
     def _check_requirements(
-        self,
-        skill_meta: dict,
-        *,
-        skill_name: str | None = None,
+        self, skill_meta: dict, *, skill_name: str | None = None
     ) -> bool:
         """Check if skill requirements are met (bins, env vars)."""
         if not self._metadata_available(skill_meta):
@@ -249,18 +296,16 @@ class SkillsLoader:
 
     @staticmethod
     def _runtime_requirements(
-        requires: dict,
-        *,
-        skill_name: str | None,
+        requires: dict, *, skill_name: str | None
     ) -> list[str]:
         value = requires.get("runtime", [])
-        if isinstance(value, str):
-            value = [value]
         if value is True and skill_name:
             return [skill_name]
+        if isinstance(value, str):
+            value = [value]
         if not isinstance(value, list):
             return []
-        return [item for item in value if isinstance(item, str) and item.strip()]
+        return [item.strip() for item in value if isinstance(item, str) and item.strip()]
 
     def _runtime_available(self, name: str) -> bool:
         return bool(
@@ -269,14 +314,14 @@ class SkillsLoader:
         )
 
     def get_active_skills(self) -> list[str]:
-        """Return available skills whose metadata requires an active runtime."""
-        result = []
+        """Return available Skills whose metadata requires an active runtime."""
+        result: list[str] = []
         for skill in self.list_skills(filter_unavailable=True):
             meta = self._get_skill_meta(skill["name"])
             requires = meta.get("requires", {})
-            if not isinstance(requires, dict):
-                continue
-            if self._runtime_requirements(requires, skill_name=skill["name"]):
+            if isinstance(requires, dict) and self._runtime_requirements(
+                requires, skill_name=skill["name"]
+            ):
                 result.append(skill["name"])
         return result
 
@@ -320,12 +365,10 @@ class SkillsLoader:
         if content.startswith("---"):
             match = re.match(r"^---\n(.*?)\n---", content, re.DOTALL)
             if match:
-                # Simple YAML parsing
-                metadata = {}
-                for line in match.group(1).split("\n"):
-                    if ":" in line:
-                        key, value = line.split(":", 1)
-                        metadata[key.strip()] = value.strip().strip('"\'')
-                return metadata
+                try:
+                    metadata = yaml.safe_load(match.group(1))
+                except yaml.YAMLError:
+                    return None
+                return metadata if isinstance(metadata, dict) else None
 
         return None

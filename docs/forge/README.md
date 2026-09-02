@@ -1,180 +1,222 @@
-# PAOS Forge Skill Installation and Development
+# Forge Tool API Integration Contract
 
-> PhyAgentOS 0.1.4.post4 · Forge ToolEndpoint `forge.tool.endpoint/v1alpha1` · [中文](README_zh.md)
+[中文](README_zh.md) · [Documentation index](../README.md)
 
-This document describes the current PAOS Forge Skill installation, runtime, and
-development path. Gateway, Forge Runtime, Dora dataflows, policies, and hardware
-integrations remain external to PAOS.
+> Applies to PhyAgentOS 1.0.0.
 
-`move-arm-by-ee` uses the Gateway Tool API and an explicitly managed local Dora
-dataflow.
-
-The [Skill Bundle manual publishing guide](skill-bundle-publishing.md) documents
-the archive root, Node locks, asset collection, TOS upload, static-catalog
-registration, and post-release acceptance. PAOS uses only the unified Resource
-Registry API and does not read repository YAML directly.
-
-## 1. Current PAOS Skill install and development flow
-
-The current executable Skill path is:
+## 1. Execution boundary
 
 ```text
-Resource Registry
-  ├── Skill name -> TOS Bundle URL + SHA-256 + size
-  └── Node artifact_id -> immutable GitHub Release URL
-             │
-             ▼
-paos skill install
-  ├── verify and install the Skill Bundle
-  ├── resolve and install missing locked Nodes
-  └── build an immutable per-profile runtime environment
-             │
-             ▼
-paos skill start -> Dora dataflow -> Forge Gateway Tool API
+AgentTask-bound call / diagnostic Query
+        → ForgeToolClient
+        → Gateway /tools → ToolInvocation → ToolEndpoint
+        → Dora and robot nodes
 ```
 
-The reference `move-arm-by-ee` source under
-`examples/forge-skills/move-arm-by-ee/` is not a built-in Skill and is not
-installed by cloning the repository. Installed Skills live under
-`~/.PhyAgentOS/skills/`.
+PAOS supports Query, Action, and Session semantics. AgentTask aggregates a user goal, but Gateway
+remains the physical execution owner. Diagnostic Query may run without a task; Action and
+task-owned Session calls require a frozen AgentTask binding. The selected Endpoint operation
+enforces `max_concurrency`; PAOS does not introduce a cross-Tool Resource/Control lease.
 
-### 0.1 Install and run a published Skill
-
-After installing PAOS, the CLI uses the public development Registry by default:
+## 2. Tool discovery and context
 
 ```text
-https://paos-resource-manager.dev.x-era.com
+GET /tools
+GET /tools/{tool_id}
+GET /tools/{tool_id}/context
 ```
 
-No Registry configuration is required for the default path. Resolution priority
-is:
+A ToolSpec declares stable identity, implementation/Endpoint binding, operation, `query|action|session`
+semantics, strict input/output schema, readiness, and robot frame profile. Context is read live
+before invocation; callers do not infer frame, unit, readiness, or binding.
 
-1. `PAOS_RESOURCE_REGISTRY_URL`;
-2. `resourceRegistry.url` in `~/.PhyAgentOS/config.json`;
-3. the built-in public development Registry.
+## 3. Query contract
 
-Install and run the MuJoCo demo:
-
-```bash
-paos skill search move-arm-by-ee
-paos skill install move-arm-by-ee
-paos skill inspect move-arm-by-ee
-
-paos skill start move-arm-by-ee --profile mujoco
-paos skill status move-arm-by-ee
-paos agent -m "move the gripper forward by 5 cm"
-paos skill stop move-arm-by-ee
-```
-
-`install` prints the Bundle source and size, warns that locked Node archives may
-also be downloaded, and asks for `y/N` confirmation before downloading. Use
-`--yes` or `-y` only for non-interactive automation:
-
-```bash
-paos skill install move-arm-by-ee --yes
-```
-
-Downloads show the artifact name, URL, transferred bytes, total size, speed,
-remaining time, cache hits, and resumed progress. A failed install does not
-replace the previously installed Skill.
-
-### 0.2 Download and installation model
-
-The Skill Bundle is a flat `.tar.gz` containing `skill.yaml`, `SKILL.md`,
-`archive-manifest.json`, profiles, configuration, and assets. PAOS verifies the
-Registry SHA-256/size and every file listed in the embedded archive manifest.
-
-Each Forge Node lock records:
+`forge_tool_query` reads the configured ToolSpec, verifies `semantics=query`, then invokes:
 
 ```text
-artifact_id
-version
-platform
-arch
-artifact_type = executable_tar_gz
-entrypoint
-sha256
+POST /tools/{endpoint_id}/{operation}:invoke
+Content-Type: application/json
+
+{
+  "arguments": {},
+  "caller_id": "paos:<task-or-diagnostic-identity>",
+  "timeout_ms": 10000
+}
 ```
 
-A Node Release archive contains exactly one root-level executable named by
-`entrypoint`. PAOS verifies the GitHub Asset SHA-256, safely extracts the
-executable, writes a local installation receipt, and links exact Node versions
-into the Skill environment.
+Success is HTTP 200 with `{ "ok": true, "data": { ... } }`. PAOS generates the caller ID. A bound Query creates a terminal PAOS
+ToolExecutionRecord under the active PlanRevision. An unbound Query returns the same Gateway data
+without task attribution.
 
-Installed resources are organized as:
+## 4. Action contract
+
+Admission:
 
 ```text
-~/.PhyAgentOS/
-├── skills/<skill-name>/
-├── cache/
-└── forge_runtime/
-    ├── nodes/<node-id>/versions/<artifact-id>/
-    │   ├── .paos-node.json
-    │   └── <entrypoint>
-    └── environments/<skill-name>/<profile>/
-        ├── <lock-digest>/
-        └── current -> <lock-digest>
+POST /tools/{tool_id}:invoke
+→ HTTP 202
+→ data.invocation_id + data.attempt_id
 ```
 
-Reinstalling the same Skill is idempotent: valid cached downloads and Nodes
-that already satisfy their locks are reused.
-
-### 0.3 Local Skill development loop
-
-Set up the repository development environment:
-
-```bash
-cd PhyAgentOS
-uv sync
-uv run paos skill --help
-dora --version
-```
-
-Develop the Skill source with this minimum layout:
+Reconciliation:
 
 ```text
-<skill>/
-├── SKILL.md
-├── skill.yaml
-├── profiles/<profile>/{dataflow.yaml,*.yaml}
-└── assets/
+GET  /invocations/{invocation_id}
+GET  /invocations/{invocation_id}/result
+POST /invocations/{invocation_id}/cancel
 ```
 
-Package and validate it locally:
+Result HTTP 202 means pending. Cancel HTTP 200/202 means the cancellation request was processed or
+accepted; it does not prove stop. A timeout means the remote state is unknown. An explicit
+`unknown` terminal outcome closes PAOS accounting as a failure but remains physically uncertain and
+must not trigger a blind retry.
 
-```bash
-uv run python scripts/package_skill.py \
-  examples/forge-skills/move-arm-by-ee \
-  --output-dir dist
+Before admission PAOS persists an Action intent and its generated caller ID. Every returned
+invocation/attempt identity is retained. A timeout or transport error leaves an `unknown` record;
+recovery may only read a persisted invocation ID and never repeats the POST blindly.
+
+## 5. Session contract
+
+A Tool with `semantics=session` is admitted through the same invoke route and returns HTTP 202 plus
+an invocation ID. Status and result use the common `/invocations/{id}` routes; an owned Session is
+stopped with `POST /invocations/{id}/stop`.
+
+PAOS records Session ownership as `task`, `shared`, or `runtime`. A task can stop only its own
+Session, shared Sessions remain live across task finalization, and runtime-owned Sessions are
+managed outside the Agent. Non-terminal task-owned Sessions block finalization and Runtime stop
+also accounts for all active Sessions.
+
+## 6. Agent tools
+
+| Tool | Contract |
+|:-----|:---------|
+| `forge_tool_context` | Read ToolSpec and live context. |
+| `forge_tool_query` | Invoke synchronous Query; diagnostic without a task or governed with `task_id`. |
+| `forge_tool_start_action` | Admit an asynchronous Action for a bound `task_id`. |
+| `forge_tool_action_status` | Read invocation phase/status. |
+| `forge_tool_action_result` | Read pending or terminal result. |
+| `forge_tool_cancel_action` | Request cancellation without asserting stop. |
+| `forge_tool_start_session` | Admit a bound Session with explicit ownership. |
+| `forge_tool_session_status/result/stop_session` | Reconcile or stop an owned Session. |
+| `forge_task_create` | Create the one active AgentTask and revision 1. |
+| `forge_task_get` | Read task, revisions, Tool records, evidence, and verdict. |
+| `forge_task_begin_revision` | Append a revision after an allowed recovery verdict. |
+| `forge_task_finalize` | Capture after evidence and apply aggregate task verification. |
+| `forge_task_cancel` | Cancel non-terminal Actions and stop task-owned Sessions. |
+
+The diagnostic context tool remains available without a Runtime. Governed tools require exactly
+one healthy active Skill Runtime. Existing general Agent tools and dynamic MCP tools remain
+registered independently.
+
+## 7. Binding, identity, and correlation
+
+`activate_skill` reads the installed workflow and previews the current Runtime. Task creation
+revalidates that candidate and freezes the Skill name/version, manifest and workflow hashes,
+profile, Runtime instance, Gateway identity, required ToolSpec hashes and Node artifact IDs. Every
+task execution rechecks membership, semantics, readiness, ToolSpec hash, and Runtime identity.
+
+| Identity | Owner | Meaning |
+|:---------|:------|:--------|
+| `task_id` | PAOS | Stable task aggregate |
+| `revision_id` | PAOS | Immutable planning generation |
+| `binding_id` | PAOS | Immutable Skill/Runtime/ToolSpec snapshot |
+| `record_id` | PAOS | Bound Query, Action, or Session record |
+| `caller_id` | PAOS | Idempotency/correlation identity persisted before admission |
+| `invocation_id` | Gateway | Asynchronous Action or Session lifecycle |
+| `attempt_id` | Gateway | Execution attempt |
+
+Correlation is explicit. IDs are not aliases and are not derived from one another.
+
+## 8. AgentTask model
+
+Only one AgentTask may be non-terminal globally; diagnostic Query does not occupy the slot. Creation and
+updates use SQLite WAL and immediate transactions. A task contains an append-only list of
+PlanRevisions. Each revision contains Tool records, a semantic verdict, and verification attempts.
+
+```text
+executing
+  ├─ finalize → succeeded | failed
+  ├─ recovery verdict → awaiting_replan → begin_revision → executing
+  └─ cancel → cancelling → reconcile → finalize → cancelled | failed
 ```
 
-The packaging script regenerates `archive-manifest.json`, creates a
-deterministic Bundle, safely extracts it for validation, and prints its SHA-256
-and `size_bytes`.
+Once a Tool record is terminal, later observations do not rewrite its execution fact. A recovery
+revision keeps the same task ID and is bounded by replan count and deadline.
 
-Install the local Bundle through the same Node-resolution and environment
-builder used by Registry installs:
+## 9. Evidence and verification
 
-```bash
-uv run paos skill install dist/move-arm-by-ee-0.2.0.tar.gz
-uv run paos skill inspect move-arm-by-ee
-uv run paos skill start move-arm-by-ee --profile mujoco
-uv run paos skill status move-arm-by-ee
-uv run paos skill stop move-arm-by-ee
-```
+PAOS performs best-effort capture before the first bound Action and after every bound Action reaches
+terminal accounting state. Evidence artifacts include source, phase, sequence, timestamps, media
+metadata, size, SHA-256, and workspace-relative references. Capture errors are recorded rather than
+hidden. Bundle identity, quality, capture-window, policy requirements, and retained artifact bytes
+are validated before the verifier receives the task context.
 
-This local loop is the required development milestone. It does not require a
-TOS account: unresolved Node locks are obtained from the Registry, while the
-Skill Bundle is read from `dist/`.
+`forge_task_finalize` aggregates all bound Tool facts and applies the task contract:
 
-New Node development remains in the Node's own repository. Publish a versioned
-single-executable `.tar.gz` as an immutable GitHub Release Asset, register its
-`artifact_id`, and copy the GitHub digest into `skill.yaml` before rebuilding
-the Skill Bundle.
+- `off`: execution-derived result;
+- `audit`: record semantic verdict, preserve execution-derived result;
+- `enforce`: semantic verdict controls success and fails closed;
+- `recovery`: enforce semantics plus bounded `replan_required`.
 
-For the complete workflows, see:
+Forge ToolResult and events are authoritative for execution. The PAOS verifier decides only whether
+the user-level task is complete. Its context includes the frozen Skill binding, PlanRevisions,
+ToolExecutionRecords, Gateway terminal results, before/after evidence, and scoped advisory Lessons.
 
-- [Skill collaboration and local development](skill-development-workflow.md)
-- [Skill Bundle packaging and publishing](skill-bundle-publishing.md)
-- [move-arm-by-ee manual release example](../../examples/forge-skills/move-arm-by-ee-manual-publishing.md)
-- [move-arm-by-ee quick start](../../examples/quick_start.md)
+## 10. Experience and evolution
+
+The terminal AgentTask is adapted into one redacted episode. It references the frozen Skill
+binding and version, PlanRevision verdicts, ToolInvocation/attempt fingerprints, and evidence without
+persisting raw outputs, credentials, endpoints, or physical parameters in learned content.
+
+Lessons and failure clusters are scoped to the bound Skill version. Evolution is fail-open and
+never alters Gateway facts, AgentTask terminal state, or verification attempts.
+
+## 11. Skill Runtime and distribution
+
+Skill Runtime installs and manages manifest-v2 Bundles. Installation requires safe contained
+paths, bounded extraction, SHA-256 file inventory, strict manifest validation, staging, atomic
+replacement, and rollback. Each Node lock fixes artifact ID, version, platform, architecture,
+archive type, root executable name, and SHA-256. Static-index downloads carry size and digest.
+Registry Node downloads use the verified Skill lock as the digest authority and resolve an exact
+size from Registry metadata or the direct-download endpoint before entering the cache. Installation
+is explicit and confirmed by default.
+
+RuntimeManager requires Dora CLI on `PATH` (v0.4.1 with `dora-message` v0.7.0 is the current Forge
+Skill compatibility baseline).
+It materializes an environment whose digest covers the selected dataflow path and profile file
+contents. `PAOS_SKILL_NAME` and `PAOS_SKILL_VERSION` are available both to Dora processes and as
+rendered dataflow placeholders.
+
+Startup persists `starting`, then runs `bash <bundle>/start.sh <name> <version>` with inherited stdio
+when the optional hook exists. Hook-enabled Bundles require Bash. After the hook succeeds,
+RuntimeManager starts local Dora services when needed, launches the named profile, waits for Gateway
+`/tools` and all required Tool contexts, and persists status/logs. A healthy active Runtime
+contributes Skill availability; its manifest is the only source of the Gateway URL. Per-Skill
+cross-process locking rejects overlapping lifecycle mutations.
+
+Normal stop is rejected while tracked non-terminal invocations, Sessions, or task bindings exist.
+Force stop records an audit event and does not change execution truth.
+
+Concrete Forge Skills, nodes, models, and simulation assets are not part of the PhyAgentOS source
+or Python distribution. They are obtained independently for local testing or deployment. The
+packaging helper creates deterministic Skill archives and the installer verifies them before
+commit.
+
+## 12. Conformance
+
+An integration is conformant when it covers Tool discovery/context, Query response, Action and
+Session admission, pending and terminal result, cancellation/stop, timeout/unknown, no-POST
+recovery, endpoint concurrency, immutable AgentTask binding/revisions, ownership, evidence,
+aggregate verification, version-scoped experience, Bundle security, transactional installation,
+Runtime health, safe switch, and availability propagation.
+
+Mock Gateway tests are sufficient for code and contract acceptance. Hardware/MuJoCo acceptance is
+recorded separately with exact artifact digests and environment.
+
+## Related documentation
+
+- [Framework Introduction](../en/01-framework-introduction.md)
+- [Configuration Reference](../en/04-forge-configuration-reference.md)
+- [Integration Development Guide](../user_development_guide/README_en.md)
+- [Operations Manual](../user_manual/README_en.md)

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -20,6 +21,7 @@ from PhyAgentOS.config.paths import (
 )
 from PhyAgentOS.skill_runtime.catalog import SkillCatalog
 from PhyAgentOS.skill_runtime.installer import InstallerError, SkillEnvironmentBuilder
+from PhyAgentOS.skill_runtime.locking import SkillOperationBusyError, SkillOperationLock
 from PhyAgentOS.skill_runtime.manifest import RuntimeProfile, SkillManifest
 from PhyAgentOS.skill_runtime.state import RuntimeState, RuntimeStateStore, utc_now
 
@@ -65,7 +67,10 @@ class RuntimeManager:
         self.state_store = state_store or RuntimeStateStore()
         self.installation_root = (runtime_root or get_forge_runtime_root()).expanduser().resolve()
         self.runtime_root = self.installation_root
-        self.environment_builder = SkillEnvironmentBuilder(self.installation_root)
+        self.environment_builder = SkillEnvironmentBuilder(
+            self.installation_root,
+            state_store=self.state_store,
+        )
         self.logs_root = (logs_root or get_skill_runtime_logs_dir()).expanduser()
         self.health_timeout_s = health_timeout_s
         self.poll_interval_s = poll_interval_s
@@ -78,6 +83,13 @@ class RuntimeManager:
         return safe
 
     def start(self, skill_name: str, profile_name: str) -> RuntimeState:
+        try:
+            with SkillOperationLock(self.state_store.root, skill_name):
+                return self._start_locked(skill_name, profile_name)
+        except (SkillOperationBusyError, ValueError) as exc:
+            raise RuntimeManagerError(str(exc)) from exc
+
+    def _start_locked(self, skill_name: str, profile_name: str) -> RuntimeState:
         manifest = self.catalog.get(skill_name)
         profile = manifest.profiles.get(profile_name)
         if profile is None:
@@ -107,7 +119,6 @@ class RuntimeManager:
                 f"Gateway address {manifest.gateway_url} is already in use; "
                 "refusing to adopt an unmanaged runtime"
             )
-        self._run_start_hook(manifest, profile_name)
 
         starting = RuntimeState(
             skill_name=skill_name,
@@ -121,10 +132,19 @@ class RuntimeManager:
         self._log(skill_name, f"starting profile={profile_name} flow={flow_name}")
         launched = False
         try:
+            self._run_start_hook(manifest, profile_name)
             self._ensure_dora_up(manifest, profile, binary_root)
             launched = True
             self._start_flow(flow_name, manifest, profile, binary_root)
             self._wait_until_ready(manifest, flow_name)
+            snapshot = self._gateway_snapshot(manifest) or {}
+            data = snapshot.get("data") if isinstance(snapshot.get("data"), dict) else {}
+            identity = data.get("gateway_identity") or data.get("gateway_id")
+            if not isinstance(identity, str) or not identity:
+                identity = "gateway_" + hashlib.sha256(
+                    json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode()
+                ).hexdigest()[:20]
+            starting = replace(starting, gateway_identity=identity)
             running = starting.with_status("running")
             self.state_store.save(running)
             self._log(skill_name, "runtime ready")
@@ -145,6 +165,13 @@ class RuntimeManager:
         state = self.state_store.load(skill_name)
         if state is None:
             return RuntimeStatusReport(None, False, False, {})
+        startup_in_progress = False
+        if state.status == "starting":
+            try:
+                with SkillOperationLock(self.state_store.root, skill_name):
+                    pass
+            except SkillOperationBusyError:
+                startup_in_progress = True
         flow_running = self._flow_running(state.flow_name)
         snapshot = self._gateway_snapshot(manifest)
         contexts = self._tool_context_readiness(manifest) if snapshot is not None else {}
@@ -156,8 +183,14 @@ class RuntimeManager:
         if live_ready and state.status in {"starting", "running", "failed"}:
             reconciled = state.with_status("running")
         elif state.status == "stopping" and not flow_running:
-            reconciled = state.with_status("stopped", active_invocations=())
-        elif state.status in {"starting", "running"} and not live_ready:
+            reconciled = state.with_status(
+                "stopped", active_invocations=(), active_sessions=(), active_task_bindings=()
+            )
+        elif (
+            state.status in {"starting", "running"}
+            and not live_ready
+            and not startup_in_progress
+        ):
             reasons = []
             if not flow_running:
                 reasons.append("Dora flow is not running")
@@ -172,18 +205,56 @@ class RuntimeManager:
         return RuntimeStatusReport(reconciled, flow_running, gateway_ready, contexts)
 
     def stop(self, skill_name: str, *, force: bool = False) -> RuntimeState:
-        self.catalog.get(skill_name)
+        try:
+            with SkillOperationLock(self.state_store.root, skill_name):
+                return self._stop_locked(skill_name, force=force)
+        except (SkillOperationBusyError, ValueError) as exc:
+            raise RuntimeManagerError(str(exc)) from exc
+
+    def _stop_locked(self, skill_name: str, *, force: bool) -> RuntimeState:
+        manifest = self.catalog.get(skill_name)
         state = self.state_store.load(skill_name)
         if state is None:
             raise RuntimeManagerError(f"Skill {skill_name!r} has no runtime state")
         if state.status == "stopped" and not self._flow_running(state.flow_name):
             return state
-        if state.active_invocations and not force:
+        active_refs = (
+            list(state.active_invocations)
+            + list(state.active_sessions)
+            + list(state.active_task_bindings)
+        )
+        if active_refs and not force:
             raise RuntimeManagerError(
-                "Runtime has non-terminal Tool invocation(s); reconcile or cancel them "
+                "Runtime has non-terminal invocation/session/task binding(s); reconcile them "
                 "before stopping, or pass --force"
             )
-        stopping = state.with_status("stopping")
+        audit_events = state.audit_events
+        if force and active_refs:
+            control_attempts = [
+                self._request_gateway_control(
+                    f"{manifest.gateway_url}/invocations/"
+                    f"{quote(invocation_id, safe='')}/cancel",
+                    reference=invocation_id,
+                    operation="cancel",
+                )
+                for invocation_id in state.active_invocations
+            ]
+            control_attempts.extend(
+                self._request_gateway_control(
+                    f"{manifest.gateway_url}/invocations/"
+                    f"{quote(session_id, safe='')}/stop",
+                    reference=session_id,
+                    operation="stop",
+                )
+                for session_id in state.active_sessions
+            )
+            audit_events = (*audit_events, {
+                "at": utc_now(),
+                "event": "force_stop_with_active_references",
+                "references": sorted(active_refs),
+                "control_attempts": control_attempts,
+            })
+        stopping = state.with_status("stopping", audit_events=audit_events)
         self.state_store.save(stopping)
         self._log(skill_name, f"stopping flow={state.flow_name} force={force}")
         try:
@@ -196,7 +267,9 @@ class RuntimeManager:
             if isinstance(exc, RuntimeManagerError):
                 raise
             raise RuntimeManagerError(message) from exc
-        stopped = stopping.with_status("stopped", active_invocations=())
+        stopped = stopping.with_status(
+            "stopped", active_invocations=(), active_sessions=(), active_task_bindings=()
+        )
         self.state_store.save(stopped)
         self._log(skill_name, "runtime stopped")
         return stopped
@@ -264,24 +337,23 @@ class RuntimeManager:
         return path
 
     def _run_start_hook(self, skill: SkillManifest, profile_name: str) -> None:
-        """skill bundle 内置 start.sh pre-hook（如存在）：大资产下载等特殊启动步骤。
-
-        `paos skill start` 在 prepare/预检之后、dora 流程启动之前执行
-        <bundle>/start.sh <skill-name> <skill-version>。stdio 直通（不捕获输出，
-        继承调用方终端——start.sh 的交互 y/n 确认直接可见）。退出码 0 → 继续
-        内置流程；非 0 → 中止启动（此时尚未落 starting 状态，不污染状态机）。
-        bundle 不含 start.sh 的 skill 直接跳过（no-op）。
-        """
+        """Run the PR98 bundle ``start.sh`` hook before launching Dora."""
         hook = skill.bundle_root / "start.sh"
         if not hook.is_file():
             return
-        self._log(
-            skill.name, f"running bundle start.sh hook (profile={profile_name})"
-        )
-        result = subprocess.run(
-            ["bash", str(hook), skill.name, skill.version],
-            check=False,
-        )
+        bash = shutil.which("bash")
+        if bash is None:
+            raise RuntimeManagerError(
+                "bundle start.sh requires bash, but bash is not available on PATH"
+            )
+        self._log(skill.name, f"running bundle start.sh hook (profile={profile_name})")
+        try:
+            result = subprocess.run(
+                [bash, str(hook), skill.name, skill.version],
+                check=False,
+            )
+        except OSError as exc:
+            raise RuntimeManagerError("failed to execute bundle start.sh hook") from exc
         if result.returncode != 0:
             raise RuntimeManagerError(
                 "bundle start.sh hook exited with code "
@@ -465,6 +537,47 @@ class RuntimeManager:
         if not isinstance(value, dict):
             raise RuntimeManagerError("Gateway health response must be a JSON object")
         return value
+
+    @staticmethod
+    def _request_gateway_control(
+        url: str,
+        *,
+        reference: str,
+        operation: str,
+    ) -> dict[str, Any]:
+        """Best-effort force-stop control without treating acceptance as termination."""
+        request = Request(
+            url,
+            data=b"{}",
+            method="POST",
+            headers={"Accept": "application/json", "Content-Type": "application/json"},
+        )
+        try:
+            with urlopen(request, timeout=2.0) as response:
+                outcome = "accepted" if response.status in {200, 202} else "rejected"
+                return {
+                    "reference": reference,
+                    "operation": operation,
+                    "outcome": outcome,
+                    "http_status": response.status,
+                    "terminal_proven": False,
+                }
+        except HTTPError as exc:
+            return {
+                "reference": reference,
+                "operation": operation,
+                "outcome": "rejected",
+                "http_status": exc.code,
+                "terminal_proven": False,
+            }
+        except (URLError, TimeoutError, OSError) as exc:
+            return {
+                "reference": reference,
+                "operation": operation,
+                "outcome": "unknown",
+                "error_type": type(exc).__name__,
+                "terminal_proven": False,
+            }
 
     @staticmethod
     def _run(

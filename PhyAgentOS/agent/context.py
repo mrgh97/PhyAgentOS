@@ -33,9 +33,13 @@ class ContextBuilder:
         self,
         workspace: Path,
         *,
+        forge_context_provider: Callable[[], str] | None = None,
+        evolution_enabled: bool = False,
         runtime_availability_provider: Callable[[str], bool] | None = None,
     ):
         self.workspace = workspace
+        self.forge_context_provider = forge_context_provider
+        self.evolution_enabled = evolution_enabled
         self.memory = MemoryStore(workspace)
         self.skills = SkillsLoader(
             workspace,
@@ -54,12 +58,11 @@ class ContextBuilder:
         if memory:
             parts.append(f"# Memory\n\n{memory}")
 
-        active_skills = list(
-            dict.fromkeys(
-                self.skills.get_always_skills()
-                + self.skills.get_active_skills()
+        active_skills = list(dict.fromkeys(self.skills.get_always_skills()))
+        if not self.evolution_enabled:
+            active_skills = list(
+                dict.fromkeys(active_skills + self.skills.get_active_skills())
             )
-        )
         if active_skills:
             active_content = self.skills.load_skills_for_context(active_skills)
             if active_content:
@@ -67,10 +70,17 @@ class ContextBuilder:
 
         skills_summary = self.skills.build_skills_summary()
         if skills_summary:
+            activation_instruction = (
+                "Before the first tool call, check these summaries. For a matching workflow, use "
+                "activate_skill with the exact Skill name; it loads the instructions and only the "
+                "applicable scoped lessons."
+                if self.evolution_enabled
+                else "To use a skill, read its SKILL.md file using the read_file tool."
+            )
             parts.append(f"""# Skills
 
-The following skills extend your capabilities. To use a skill, read its SKILL.md file using the read_file tool.
-Skills with available="false" need dependencies installed first - you can try installing them with apt/brew.
+The following skills extend your capabilities. {activation_instruction}
+Skills with available="false" cannot be activated until their declared dependencies and Runtime are ready.
 
 {skills_summary}""")
 
@@ -95,6 +105,20 @@ Skills with available="false" need dependencies installed first - you can try in
 - Use file tools when they are simpler or more reliable than shell commands.
 """
 
+        forge_policy = ""
+        if self.forge_context_provider is not None:
+            forge_policy = (
+                "- Physical execution is available only through registered Forge tools.\n"
+                "- Activate the matching Skill before task-bound execution.\n"
+                "- Create an AgentTask before starting any Action.\n"
+                "- Never invent tool IDs, Gateway URLs, caller IDs, or readiness.\n"
+                "- Query live context before the first invocation and after readiness changes.\n"
+                "- Gateway success is an execution fact; finalize the AgentTask for user-level "
+                "success.\n\n"
+                "## Forge Execution\n"
+                + self.forge_context_provider()
+            )
+
         return f"""# PhyAgentOS 🍞
 
 You are PhyAgentOS, a helpful AI assistant.
@@ -116,6 +140,7 @@ Your workspace is at: {workspace_path}
 - After writing or editing a file, re-read it if accuracy matters.
 - If a tool call fails, analyze the error before retrying with a different approach.
 - Ask for clarification when the request is ambiguous.
+{forge_policy}
 
 Reply directly with text for conversations. Only use the 'message' tool to send to a specific chat channel."""
 
@@ -146,6 +171,8 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
         # Embodied extensions — present only when the workspace provides them.
         for filename in self.EMBODIED_FILES:
+            if self.evolution_enabled and filename == "LESSONS.md":
+                continue
             file_path = self.workspace / filename
             if file_path.exists():
                 content = file_path.read_text(encoding="utf-8")

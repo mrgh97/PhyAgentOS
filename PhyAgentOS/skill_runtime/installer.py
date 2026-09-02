@@ -15,6 +15,7 @@ import yaml
 
 from PhyAgentOS.config.paths import get_forge_runtime_root, get_skill_bundle_root
 from PhyAgentOS.skill_runtime.archive import ArchiveValidator, sha256_file
+from PhyAgentOS.skill_runtime.locking import SkillOperationBusyError, SkillOperationLock
 from PhyAgentOS.skill_runtime.manifest import NodeLock, SkillManifest, load_manifest
 from PhyAgentOS.skill_runtime.runtime_manifest import normalize_arch, normalize_platform
 from PhyAgentOS.skill_runtime.state import RuntimeStateStore
@@ -41,7 +42,10 @@ def _active_skills(store: RuntimeStateStore) -> list[str]:
             active.append(path.stem)
             continue
         if state is not None and (
-            state.status in {"starting", "running", "stopping"} or state.active_invocations
+            state.status in {"starting", "running", "stopping"}
+            or state.active_invocations
+            or state.active_sessions
+            or state.active_task_bindings
         ):
             active.append(state.skill_name)
     return sorted(active)
@@ -66,6 +70,7 @@ class SkillInstaller:
         archive: Path,
         *,
         expected_sha256: str | None = None,
+        verify_archive_manifest: bool = True,
     ) -> SkillManifest:
         self.root.mkdir(parents=True, exist_ok=True)
         temporary = Path(tempfile.mkdtemp(prefix=".skill-install-", dir=self.root))
@@ -78,6 +83,7 @@ class SkillInstaller:
                 archive,
                 extracted,
                 expected_sha256=expected_sha256,
+                verify_manifest=verify_archive_manifest,
             )
             payload = _payload_root(extracted, "skill.yaml")
             if not (payload / "SKILL.md").is_file():
@@ -96,36 +102,45 @@ class SkillInstaller:
             manifest = load_manifest(normalized / "skill.yaml")
             if manifest.skill_document != Path("SKILL.md"):
                 raise InstallerError("installed Skill skill_document must be SKILL.md")
-            target = self.root / manifest.name
-            if target.exists():
-                if manifest.name in _active_skills(self.state_store):
-                    raise InstallerError(f"Skill {manifest.name!r} is currently running")
-                try:
-                    old_version = load_manifest(target / "skill.yaml").version
-                except Exception:
-                    try:
-                        legacy = yaml.safe_load(
-                            (target / "skill.yaml").read_text(encoding="utf-8")
-                        )
-                        old_version = str(legacy.get("version", "legacy"))
-                    except Exception:
-                        old_version = "legacy"
-                stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
-                backup = self.root / ".backups" / manifest.name / f"{old_version}-{stamp}"
-                backup.parent.mkdir(parents=True, exist_ok=True)
-                os.replace(target, backup)
             try:
-                os.replace(normalized, target)
-                installed = load_manifest(target / "skill.yaml")
-            except Exception:
-                if target is not None and target.exists():
-                    failed = temporary / ".failed-install"
-                    os.replace(target, failed)
-                if backup is not None and target is not None:
-                    os.replace(backup, target)
-                raise
-            committed = True
-            return installed
+                with SkillOperationLock(self.state_store.root, manifest.name):
+                    target = self.root / manifest.name
+                    if target.exists():
+                        if manifest.name in _active_skills(self.state_store):
+                            raise InstallerError(f"Skill {manifest.name!r} is currently running")
+                        try:
+                            old_version = load_manifest(target / "skill.yaml").version
+                        except Exception:
+                            try:
+                                legacy = yaml.safe_load(
+                                    (target / "skill.yaml").read_text(encoding="utf-8")
+                                )
+                                old_version = str(legacy.get("version", "legacy"))
+                            except Exception:
+                                old_version = "legacy"
+                        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
+                        backup = (
+                            self.root
+                            / ".backups"
+                            / manifest.name
+                            / f"{old_version}-{stamp}"
+                        )
+                        backup.parent.mkdir(parents=True, exist_ok=True)
+                        os.replace(target, backup)
+                    try:
+                        os.replace(normalized, target)
+                        installed = load_manifest(target / "skill.yaml")
+                    except Exception:
+                        if target is not None and target.exists():
+                            failed = temporary / ".failed-install"
+                            os.replace(target, failed)
+                        if backup is not None and target is not None:
+                            os.replace(backup, target)
+                        raise
+                    committed = True
+                    return installed
+            except SkillOperationBusyError as exc:
+                raise InstallerError(str(exc)) from exc
         except InstallerError:
             raise
         except Exception as exc:
@@ -136,19 +151,23 @@ class SkillInstaller:
             shutil.rmtree(temporary, ignore_errors=True)
 
     def remove(self, name: str) -> None:
-        target = self.root / name
-        if name in {"", ".", ".."} or "/" in name or "\\" in name or not target.is_dir():
-            raise InstallerError(f"Skill {name!r} is not installed")
-        if name in _active_skills(self.state_store):
-            raise InstallerError(f"Skill {name!r} is currently running")
-        temporary = self.root / f".remove-{name}-{os.getpid()}"
-        os.replace(target, temporary)
         try:
-            shutil.rmtree(temporary)
-        except Exception:
-            if not target.exists():
-                os.replace(temporary, target)
-            raise
+            with SkillOperationLock(self.state_store.root, name):
+                target = self.root / name
+                if not target.is_dir():
+                    raise InstallerError(f"Skill {name!r} is not installed")
+                if name in _active_skills(self.state_store):
+                    raise InstallerError(f"Skill {name!r} is currently running")
+                temporary = self.root / f".remove-{name}-{os.getpid()}"
+                os.replace(target, temporary)
+                try:
+                    shutil.rmtree(temporary)
+                except Exception:
+                    if not target.exists():
+                        os.replace(temporary, target)
+                    raise
+        except (SkillOperationBusyError, ValueError) as exc:
+            raise InstallerError(str(exc)) from exc
 
 
 class NodeInstaller:
@@ -191,7 +210,6 @@ class NodeInstaller:
             staged = temporary / lock.entrypoint
             self._extract_executable(archive, staged, lock)
             staged.chmod(0o755)
-            binary_sha256 = sha256_file(staged)
             receipt = {
                 "schema_version": 1,
                 "node_id": lock.node_id,
@@ -199,7 +217,7 @@ class NodeInstaller:
                 "artifact_type": lock.artifact_type,
                 "entrypoint": lock.entrypoint,
                 "archive_sha256": lock.sha256,
-                "binary_sha256": binary_sha256,
+                "binary_sha256": sha256_file(staged),
             }
             (temporary / self.receipt_name).write_text(
                 json.dumps(receipt, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
@@ -248,7 +266,6 @@ class NodeInstaller:
         return path
 
     def satisfies(self, lock: NodeLock) -> bool:
-        """Return whether the exact locked executable is installed and valid."""
         try:
             self.load(lock)
         except InstallerError:
@@ -283,9 +300,7 @@ class NodeInstaller:
                 member = files[0]
                 normalized_name = member.name.removeprefix("./")
                 if "/" in normalized_name or "\\" in normalized_name:
-                    raise InstallerError(
-                        "Forge node executable must be at the archive root"
-                    )
+                    raise InstallerError("Forge node executable must be at the archive root")
                 if normalized_name != lock.entrypoint:
                     raise InstallerError(
                         "Forge node archive filename does not match Skill entrypoint"
@@ -306,10 +321,15 @@ class NodeInstaller:
 class SkillEnvironmentBuilder:
     """Create immutable per-Skill executable views from exact node locks."""
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        state_store: RuntimeStateStore | None = None,
+    ) -> None:
         self.runtime_root = (root or get_forge_runtime_root()).expanduser()
         self.environments = self.runtime_root / "environments"
-        self.nodes = NodeInstaller(self.runtime_root)
+        self.nodes = NodeInstaller(self.runtime_root, state_store=state_store)
 
     def prepare(self, skill: SkillManifest, profile_name: str) -> Path:
         profile = skill.profiles.get(profile_name)
@@ -343,10 +363,8 @@ class SkillEnvironmentBuilder:
                 for lock, _ in providers.values()
             },
             "entrypoints": sorted(required),
+            "dataflow": profile.dataflow.as_posix(),
         }
-        # 环境镜像 = 节点锁 + profile 文件内容。profile 文件（dataflow 与配置）变化
-        # 必须触发重渲染：同版本重装 bundle 时，旧 digest 只覆盖节点锁会导致
-        # 渲染副本（dataflow）滞留旧内容、只有符号链接（其余配置）跟随新 bundle。
         profile_files: dict[str, str] = {}
         profile_parent = skill.bundle_root / profile.dataflow.parent
         for source in sorted(profile_parent.iterdir()):
@@ -390,11 +408,8 @@ class SkillEnvironmentBuilder:
                 rendered = source_dataflow.read_text(encoding="utf-8").replace(
                     "${FORGE_RUNTIME_BIN}", str((target / "bin").resolve())
                 ).replace("${PAOS_SKILL_ROOT}", str(skill.bundle_root))
-                # dora daemon 不向节点透传父进程环境：dataflow env 段是唯一可靠
-                # 注入通道，节点（如 kai0_policy 推导默认权重路径）依赖这两个变量。
-                rendered = (
-                    rendered.replace("${PAOS_SKILL_NAME}", skill.name)
-                    .replace("${PAOS_SKILL_VERSION}", skill.version)
+                rendered = rendered.replace("${PAOS_SKILL_NAME}", skill.name).replace(
+                    "${PAOS_SKILL_VERSION}", skill.version
                 )
                 (launch_profile / profile.dataflow.name).write_text(
                     rendered, encoding="utf-8"
