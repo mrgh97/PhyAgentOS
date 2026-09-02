@@ -1,0 +1,23 @@
+suite: libero_10
+task_ids: ""
+init_state_ids: ""
+num_runs: 1
+
+max_steps: 300
+num_steps_wait: 10
+control_mode: relative
+seed: 0
+layout_mode: per_episode
+
+camera_height: 256
+camera_width: 256
+
+policy_id: lingbot_va_libero
+send_instruction: true
+
+serve: true
+max_total_episodes: 10
+max_max_steps: 600
+
+result_dir: results
+record_dir: null

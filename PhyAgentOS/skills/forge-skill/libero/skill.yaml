@@ -1,0 +1,57 @@
+manifest_version: 2
+name: libero
+version: "0.1.0"
+description: Run the generic LIBERO benchmark with a profile-selected policy inference node.
+skill_document: SKILL.md
+gateway_url: http://127.0.0.1:19003
+required_tools:
+  - libero.benchmark.describe
+  - libero.benchmark.run
+  - libero.policy
+profiles:
+  lingbot_va:
+    dataflow: profiles/lingbot_va/dataflow.yaml
+    startup_timeout_s: 900
+    required_binaries:
+      - gateway
+      - libero_benchmark
+      - lerobot_runner
+    required_assets:
+      - profiles/lingbot_va/gateway.yaml
+      - profiles/lingbot_va/benchmark.yaml
+      - profiles/lingbot_va/policy.yaml
+    required_environment:
+      - FORGE_GATEWAY_ROOT
+      - FORGE_GATEWAY_PYTHON
+      - LIBERO_BENCHMARK_ROOT
+      - LIBERO_BENCHMARK_PYTHON
+      - LEROBOT_RUNNER_PYTHON
+      - LINGBOT_VA_MODEL_DIR
+      - LINGBOT_VA_BASE_DIR
+    environment:
+      MUJOCO_GL: egl
+      PYOPENGL_PLATFORM: egl
+      HF_HUB_OFFLINE: "1"
+      HF_HUB_DISABLE_XET: "1"
+      TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD: "1"
+artifacts:
+  resolver: local
+  nodes:
+    gateway:
+      artifact_id: gateway-1.1.0-source-session-v1
+      version: "1.1.0"
+      platform: linux
+      arch: x86_64
+      digest: 91c7cc832b57255b273208117429b4febe1ba4fd0e7224e7879d94aca736d17e
+    libero_benchmark:
+      artifact_id: libero-benchmark-1.0.0-source-session-v1
+      version: "1.0.0"
+      platform: linux
+      arch: x86_64
+      digest: 451f6e42d63ea1f4b4259b7fa8a89bc3b8ac95f44b43f26c03ec4192d6544779
+    lerobot_runner:
+      artifact_id: lerobot-runner-1.0.2-source-session-v1
+      version: "1.0.2-session.1"
+      platform: linux
+      arch: x86_64
+      digest: 7d1f42d56e428a239c3d045a99a56468d2d656bcc9736e76005d79362d0d418a
